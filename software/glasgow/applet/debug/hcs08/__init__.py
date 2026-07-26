@@ -385,6 +385,12 @@ FCMD_MASS_ERASE    = 0x41
 
 FLASH_PAGE_SIZE = 512
 
+# BDC commands pipelined into one USB transfer by `_burst`. Each memory access returns 2 bytes,
+# so this keeps at most 256 bytes of response in flight, comfortably inside one 512-byte FX2 IN
+# endpoint buffer. Larger batches buy nothing: past a few dozen commands the USB round trip is
+# already amortised to insignificance against the BDC bit time.
+_BURST_COMMANDS = 128
+
 
 class DebugHCS08Interface:
     def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
@@ -439,10 +445,13 @@ class DebugHCS08Interface:
         self._log(f"sync count={count} divisor={divisor} freq={frequency/1e6:.3f}MHz")
         return frequency
 
-    async def _command(self, opcode: int, *,
-                       address: int | None = None, write: bytes = b"",
-                       delay: bool = False, status: bool = False, read: int = 0) -> bytes:
-        """Issue one BDC command, following the coding structure of HCS08RMV1 Table 7-1."""
+    def _encode(self, opcode: int, *,
+                address: int | None = None, write: bytes = b"",
+                delay: bool = False, status: bool = False, read: int = 0) -> tuple[bytes, int]:
+        """Encode one BDC command per the coding structure of HCS08RMV1 Table 7-1.
+
+        Returns the gateware opcodes implementing it and the number of bytes it will return.
+        """
         if self._divisor is None:
             raise HCS08Error("BDC bit timing is not configured; call sync() first")
         seq = bytearray([_Command.Transmit.value, opcode])
@@ -455,15 +464,50 @@ class DebugHCS08Interface:
             seq += bytes([_Command.Delay.value])
         count = read + (1 if status else 0)
         seq += bytes([_Command.Receive.value]) * count
+        return bytes(seq), count
+
+    async def _command(self, opcode: int, **kwargs) -> bytes:
+        """Issue one BDC command and return its response."""
+        seq, count = self._encode(opcode, **kwargs)
         await self._pipe.send(seq)
         await self._pipe.flush()
         if count == 0:
             return b""
         data = bytes(await self._pipe.recv(count))
-        if status:
+        if kwargs.get("status"):
             self._check_status(BDCStatus(data[0]), opcode)
             return data[1:]
         return data
+
+    async def _burst(self, opcode: int, params: list[dict], response_len: int) -> list[bytes]:
+        """Issue many identical-shaped BDC commands, sharing one USB round trip per batch.
+
+        Only the ``_WS`` command variants may be used: the status byte each one reports is how
+        a failure part-way through a batch is detected, since nothing else inspects the target
+        between commands.
+
+        A single BDC command costs well under a millisecond of bit time but a full USB round trip
+        to set up, so issuing them one at a time is dominated by round trips rather than by the
+        target. Pipelining a batch into one transfer removes that. Batches are sized so the
+        responses in flight stay far below the 512-byte FX2 IN endpoint: the component cannot
+        stall for want of somewhere to put them, which would otherwise deadlock against `send`.
+        """
+        results = []
+        for start in range(0, len(params), _BURST_COMMANDS):
+            batch = params[start:start + _BURST_COMMANDS]
+            seq = bytearray()
+            for kwargs in batch:
+                ops, count = self._encode(opcode, **kwargs)
+                assert count == response_len
+                seq += ops
+            await self._pipe.send(seq)
+            await self._pipe.flush()
+            data = bytes(await self._pipe.recv(len(batch) * response_len))
+            for index in range(len(batch)):
+                response = data[index * response_len:(index + 1) * response_len]
+                self._check_status(BDCStatus(response[0]), opcode)
+                results.append(response[1:])
+        return results
 
     def _check_status(self, status: BDCStatus, opcode: int):
         if status.wsf:
@@ -521,15 +565,24 @@ class DebugHCS08Interface:
     async def read(self, address: int, length: int) -> bytes:
         """Read ``length`` bytes of target memory starting at ``address``."""
         assert address in range(0x10000) and address + length <= 0x10000
-        # READ_NEXT would be faster but requires active background mode and clobbers H:X, so
-        # plain READ_BYTE_WS is used to keep reads usable while the target is running.
-        return bytes([await self.read_byte(address + offset) for offset in range(length)])
+        # READ_NEXT_WS would shave two byte times per access, but it requires active background
+        # mode and clobbers H:X, so plain READ_BYTE_WS is used to keep reads usable while
+        # the target is running.
+        self._log(f"read {address:#06x} length={length}")
+        responses = await self._burst(_BDC.READ_BYTE_WS, [
+            dict(address=address + offset, delay=True, status=True, read=1)
+            for offset in range(length)
+        ], response_len=2)
+        return b"".join(responses)
 
     async def write(self, address: int, data: bytes):
         """Write ``data`` to target memory starting at ``address``."""
         assert address in range(0x10000) and address + len(data) <= 0x10000
-        for offset, byte in enumerate(data):
-            await self.write_byte(address + offset, byte)
+        self._log(f"write {address:#06x} length={len(data)}")
+        await self._burst(_BDC.WRITE_BYTE_WS, [
+            dict(address=address + offset, write=bytes([byte]), delay=True, status=True)
+            for offset, byte in enumerate(data)
+        ], response_len=1)
 
     async def read_bkpt(self) -> int:
         """Read the BDC breakpoint match register (BDCBKPT)."""
