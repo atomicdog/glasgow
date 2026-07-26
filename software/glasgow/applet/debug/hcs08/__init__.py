@@ -727,16 +727,39 @@ class DebugHCS08Interface:
 
     # === FLASH programming ===
 
-    async def flash_init(self, bus_frequency: float):
+    async def get_bus_frequency(self) -> float:
+        """Determine the target bus clock frequency, in Hz, from the recovered BDC clock.
+
+        Only meaningful while ``CLKSW`` is set, which selects the bus clock as the source of the
+        BDC clock; the frequency :meth:`sync` measured is then the bus frequency. With ``CLKSW``
+        clear the BDC runs from a fixed alternate source unrelated to the bus, and the frequency
+        has to be supplied by the caller.
+        """
+        if self._divisor is None:
+            raise HCS08Error("BDC bit timing is not configured; call sync() first")
+        status = await self.read_status()
+        if not status.clksw:
+            raise HCS08Error(
+                f"cannot derive the bus frequency while CLKSW is clear (status {status}): the BDC "
+                f"is clocked from the fixed alternate source, which is independent of the bus "
+                f"clock; specify the bus frequency explicitly")
+        return 1.0 / self.bdc_clock_period
+
+    async def flash_init(self, bus_frequency: float | None = None):
         """Configure the FLASH clock divider for a given target bus frequency, in Hz.
 
         The FLASH command state machine requires a 150..200 kHz internal clock; see MC9S08AW60
         §4.6.1. ``FCDIV`` is write-once per reset, so this is a no-op if it is already loaded.
+
+        If ``bus_frequency`` is :py:`None` it is obtained from :meth:`get_bus_frequency`, which
+        requires ``CLKSW`` to be set — as it is after :meth:`reset_into_bdm`.
         """
         fcdiv = await self.read_byte(FCDIV_addr)
         if fcdiv & 0x80: # DIVLD
             self._log(f"flash divider already loaded FCDIV={fcdiv:#04x}")
             return
+        if bus_frequency is None:
+            bus_frequency = await self.get_bus_frequency()
         # Clear any stale error flag; FCDIV cannot be written while FACCERR is set.
         await self._flash_clear_errors()
         prdiv8, div = self._flash_divider(bus_frequency)
@@ -918,9 +941,10 @@ class DebugHCS08Applet(GlasgowAppletV2):
     (pin 4) is optional but required to halt a target whose FLASH is blank or whose program
     disables the BDC, since that needs BKGD held low across the rising edge of RESET.
 
-    FLASH programming additionally needs the target bus frequency (--bus-frequency), because the
-    FLASH command state machine must be clocked between 150 and 200 kHz and the divider that
-    achieves this cannot be derived from the BDC clock.
+    FLASH operations need the target bus frequency, because the FLASH command state machine must
+    be clocked between 150 and 200 kHz. It is normally derived from the recovered BDC clock, which
+    is valid whenever the BDC is clocked from the bus (as it is after --reset-into-bdm); pass
+    --bus-frequency to override that, or if the target selects the alternate BDC clock source.
     """
     # BKGD is a pseudo-open-drain signal; the revA/B level shifters interfere with it.
     required_revision = "C0"
@@ -990,23 +1014,31 @@ class DebugHCS08Applet(GlasgowAppletV2):
             "data", metavar="DATA", type=lambda value: bytes.fromhex(value),
             help="hexadecimal data to write")
 
+        def add_bus_frequency_argument(parser):
+            parser.add_argument(
+                "--bus-frequency", metavar="FREQ", type=float, default=None,
+                help="target bus clock frequency in MHz "
+                     "(default: derived from the recovered BDC clock)")
+
         p_erase = p_operation.add_parser(
             "erase", help="mass erase the FLASH array")
+        add_bus_frequency_argument(p_erase)
 
         p_program = p_operation.add_parser(
             "program", help="erase and program FLASH from an S-record file")
         p_program.add_argument(
             "file", metavar="FILE", type=argparse.FileType("r"),
             help="S-record (S19) file to program")
-        p_program.add_argument(
-            "--bus-frequency", metavar="FREQ", type=float, required=True,
-            help="target bus clock frequency, in MHz")
+        add_bus_frequency_argument(p_program)
         p_program.add_argument(
             "--no-verify", default=False, action="store_true",
             help="skip read-back verification")
 
     async def run(self, args):
         iface = self.hcs08_iface
+        bus_frequency = None
+        if getattr(args, "bus_frequency", None) is not None:
+            bus_frequency = args.bus_frequency * 1e6
 
         match args.operation:
             case "status":
@@ -1050,6 +1082,8 @@ class DebugHCS08Applet(GlasgowAppletV2):
 
             case "erase":
                 await iface.enable_bdm()
+                # Erase is a FLASH command like any other, so it too needs FCDIV loaded first.
+                await iface.flash_init(bus_frequency)
                 await iface.flash_mass_erase()
                 self.logger.info("FLASH mass erased")
 
@@ -1057,7 +1091,7 @@ class DebugHCS08Applet(GlasgowAppletV2):
                 chunks = coalesce(parse_srecord(args.file.read()))
                 total = sum(len(data) for _, data in chunks)
                 await iface.enable_bdm()
-                await iface.flash_init(args.bus_frequency * 1e6)
+                await iface.flash_init(bus_frequency)
                 await iface.flash_unprotect()
                 await iface.flash_mass_erase()
                 for address, data in chunks:
