@@ -768,18 +768,20 @@ class DebugHCS08Interface:
         self._log("flash unprotect")
         await self.write_byte(FPROT_addr, 0xFF)
 
-    async def _flash_command(self, address: int, value: int, command: int, *, timeout: int = 1000):
-        """Run the three-step FLASH command sequence of MC9S08AW60 §4.4.3."""
-        await self._flash_clear_errors()
-        fstat = await self.read_byte(FSTAT_addr)
-        if not fstat & FSTAT_FCBEF:
-            raise HCS08Error(f"FLASH command buffer not empty (FSTAT {fstat:#04x})")
-        # 1. Latch address and data by writing to the FLASH array.
-        await self.write_byte(address, value)
-        # 2. Latch the command code.
-        await self.write_byte(FCMD_addr, command)
-        # 3. Clear FCBEF to launch the command.
-        await self.write_byte(FSTAT_addr, FSTAT_FCBEF)
+    def _flash_launch(self, address: int, value: int, command: int) -> list[dict]:
+        """Encode the three-step FLASH command sequence of MC9S08AW60 §4.4.3.
+
+        Returns `_burst` parameters for: latching address and data by writing to the FLASH array,
+        latching the command code, then clearing FCBEF to launch.
+        """
+        return [
+            dict(address=address, write=bytes([value]), delay=True, status=True),
+            dict(address=FCMD_addr, write=bytes([command]), delay=True, status=True),
+            dict(address=FSTAT_addr, write=bytes([FSTAT_FCBEF]), delay=True, status=True),
+        ]
+
+    async def _flash_wait(self, address: int, command: int, *, timeout: int = 1000):
+        """Poll FSTAT until the FLASH command completes, raising on any error flag."""
         for _ in range(timeout):
             fstat = await self.read_byte(FSTAT_addr)
             if fstat & FSTAT_FACCERR:
@@ -791,6 +793,20 @@ class DebugHCS08Interface:
             if fstat & FSTAT_FCCF:
                 return
         raise HCS08Error(f"FLASH command {command:#04x} at {address:#06x} did not complete")
+
+    async def _flash_ready(self):
+        """Clear stale error flags and confirm the FLASH command buffer is empty."""
+        await self._flash_clear_errors()
+        fstat = await self.read_byte(FSTAT_addr)
+        if not fstat & FSTAT_FCBEF:
+            raise HCS08Error(f"FLASH command buffer not empty (FSTAT {fstat:#04x})")
+
+    async def _flash_command(self, address: int, value: int, command: int, *, timeout: int = 1000):
+        """Run one FLASH command to completion."""
+        await self._flash_ready()
+        await self._burst(_BDC.WRITE_BYTE_WS, self._flash_launch(address, value, command),
+                          response_len=1)
+        await self._flash_wait(address, command, timeout=timeout)
 
     async def flash_mass_erase(self):
         """Erase the entire FLASH array."""
@@ -808,11 +824,32 @@ class DebugHCS08Interface:
 
         The page containing each address must have been erased first; the HCS08 FLASH does not
         permit programming a byte twice without an intervening erase.
+
+        Uses the burst program command, which leaves the charge pump enabled between bytes as long
+        as the next command is queued before the current one finishes and stays within the same
+        64-byte row (MC9S08AW60 §4.4.4). Failing either condition only costs the standard program
+        time for that byte, so a sparse image remains correct, just slower.
         """
         self._log(f"flash program {address:#06x} length={len(data)}")
+        await self._flash_ready()
+
+        # Figure 4-4 polls FCBEF between bytes, to avoid writing to the array while the command
+        # buffer is full (which would set FACCERR and drop the byte). That poll is redundant over
+        # BDM: one BDC write takes ~5 byte times, ~165 us at a 4 MHz BDC clock, whereas the buffer
+        # frees within a few bus cycles and a burst byte programs in ~20 us. The handshake is
+        # therefore always long satisfied by the time the next command arrives, so the sequences
+        # are queued back to back and FSTAT is examined once at the end. FACCERR and FPVIOL are
+        # sticky, so a violation anywhere in the batch is still caught -- and `flash_verify`
+        # independently catches any byte that failed to take.
+        params = []
         for offset, byte in enumerate(data):
-            if byte != 0xFF: # an erased byte is already 0xFF, so skip the command entirely
-                await self._flash_command(address + offset, byte, FCMD_BYTE_PROGRAM)
+            if byte == 0xFF: # an erased byte is already 0xFF, so skip the sequence entirely
+                continue
+            params += self._flash_launch(address + offset, byte, FCMD_BURST_PROGRAM)
+        if not params:
+            return
+        await self._burst(_BDC.WRITE_BYTE_WS, params, response_len=1)
+        await self._flash_wait(address, FCMD_BURST_PROGRAM)
 
     async def flash_verify(self, address: int, data: bytes):
         """Read back and compare ``data`` against FLASH starting at ``address``."""
