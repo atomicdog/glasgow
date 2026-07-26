@@ -391,6 +391,15 @@ FLASH_PAGE_SIZE = 512
 # already amortised to insignificance against the BDC bit time.
 _BURST_COMMANDS = 128
 
+# How many times a memory access reporting DVF is retried before giving up. Each attempt races the
+# target CPU for a bus cycle independently, and a running target was measured losing roughly half
+# of them, so this leaves an ample margin over a whole-chip read while still terminating against a
+# target that never yields the bus.
+_DVF_RETRIES = 32
+
+# Commands whose DVF recovery is to wait rather than to reissue; see `_recover_writes`.
+_WRITE_OPCODES = frozenset({0xC1, 0x51}) # WRITE_BYTE_WS, WRITE_NEXT_WS
+
 
 class DebugHCS08Interface:
     def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
@@ -491,23 +500,71 @@ class DebugHCS08Interface:
         target. Pipelining a batch into one transfer removes that. Batches are sized so the
         responses in flight stay far below the 512-byte FX2 IN endpoint: the component cannot
         stall for want of somewhere to put them, which would otherwise deadlock against `send`.
+
+        Accesses that report DVF are recovered as described in :meth:`_recover_writes` and by
+        reissue for reads; see there for why the two directions cannot share a recovery.
         """
-        results = []
+        results: list[bytes | None] = [None] * len(params)
         for start in range(0, len(params), _BURST_COMMANDS):
-            batch = params[start:start + _BURST_COMMANDS]
-            seq = bytearray()
-            for kwargs in batch:
-                ops, count = self._encode(opcode, **kwargs)
-                assert count == response_len
-                seq += ops
-            await self._pipe.send(seq)
-            await self._pipe.flush()
-            data = bytes(await self._pipe.recv(len(batch) * response_len))
-            for index in range(len(batch)):
-                response = data[index * response_len:(index + 1) * response_len]
-                self._check_status(BDCStatus(response[0]), opcode)
-                results.append(response[1:])
-        return results
+            pending = list(range(start, min(start + _BURST_COMMANDS, len(params))))
+            for _ in range(_DVF_RETRIES + 1):
+                responses = await self._exchange(
+                    opcode, [params[index] for index in pending], response_len)
+                deferred = []
+                for index, response in zip(pending, responses):
+                    status = BDCStatus(response[0])
+                    if status.dvf:
+                        deferred.append(index)
+                    else:
+                        self._check_status(status, opcode)
+                        results[index] = response[1:]
+                if not deferred:
+                    break
+                if opcode in _WRITE_OPCODES:
+                    await self._recover_writes(opcode, len(deferred))
+                    for index in deferred:
+                        results[index] = b""
+                    break
+                # A read simply did not happen, so reissuing it is harmless and idempotent.
+                # HCS08RMV1 §7.3.4.9 offers READ_LAST for this, but it rereads whichever address
+                # was read last, and within a batch that has already moved on -- so the original
+                # address is sent again instead.
+                self._log(f"retrying {len(deferred)} read(s) after DVF")
+                pending = deferred
+            else:
+                raise HCS08Error(
+                    f"BDC command {opcode:#04x} still reported DVF for {len(pending)} access(es) "
+                    f"after {_DVF_RETRIES} retries; the target CPU may be monopolising the bus")
+        return [result for result in results if result is not None]
+
+    async def _exchange(self, opcode: int, params: list[dict], response_len: int) -> list[bytes]:
+        """Send one batch of identically-shaped commands and return their raw responses."""
+        seq = bytearray()
+        for kwargs in params:
+            ops, count = self._encode(opcode, **kwargs)
+            assert count == response_len
+            seq += ops
+        await self._pipe.send(seq)
+        await self._pipe.flush()
+        data = bytes(await self._pipe.recv(len(params) * response_len))
+        return [data[index * response_len:(index + 1) * response_len]
+                for index in range(len(params))]
+
+    async def _recover_writes(self, opcode: int, count: int):
+        """Wait out writes that reported DVF, without reissuing them.
+
+        The BDC steals a bus cycle to reach memory, and while the target CPU is running that steal
+        can lose the race and set DVF. Unlike a read, a write that reports DVF has nonetheless
+        been *latched* by the command itself, so HCS08RMV1 §7.3.4.5 has the host poll status until
+        the latched access completes rather than repeat the write. Repeating one matters: against
+        FLASH it would program a byte twice, which is forbidden without an intervening erase.
+        """
+        self._log(f"waiting out {count} latched write(s) after DVF")
+        for _ in range(_DVF_RETRIES):
+            if not (await self.read_status()).dvf:
+                return
+        raise HCS08Error(f"BDC command {opcode:#04x} still reported DVF after {_DVF_RETRIES} "
+                         f"status polls; the latched write did not complete")
 
     def _check_status(self, status: BDCStatus, opcode: int):
         if status.wsf:
@@ -550,8 +607,9 @@ class DebugHCS08Interface:
     async def read_byte(self, address: int) -> int:
         """Read one byte of target memory, checking the resulting status."""
         assert address in range(0x10000)
-        data = await self._command(_BDC.READ_BYTE_WS, address=address,
-                                   delay=True, status=True, read=1)
+        # Routed through `_burst` for its DVF recovery, which a running target needs.
+        data, = await self._burst(_BDC.READ_BYTE_WS,
+            [dict(address=address, delay=True, status=True, read=1)], response_len=2)
         self._log(f"read {address:#06x}={data[0]:#04x}")
         return data[0]
 
@@ -559,8 +617,9 @@ class DebugHCS08Interface:
         """Write one byte of target memory, checking the resulting status."""
         assert address in range(0x10000) and value in range(0x100)
         self._log(f"write {address:#06x}={value:#04x}")
-        await self._command(_BDC.WRITE_BYTE_WS, address=address, write=bytes([value]),
-                            delay=True, status=True)
+        await self._burst(_BDC.WRITE_BYTE_WS,
+            [dict(address=address, write=bytes([value]), delay=True, status=True)],
+            response_len=1)
 
     async def read(self, address: int, length: int) -> bytes:
         """Read ``length`` bytes of target memory starting at ``address``."""

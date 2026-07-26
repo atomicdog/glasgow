@@ -1,3 +1,6 @@
+import asyncio
+import logging as py_logging
+
 from amaranth import *
 from amaranth.lib import io
 from amaranth.sim import Simulator
@@ -5,9 +8,34 @@ from amaranth.sim import Simulator
 from glasgow.gateware.ports import PortGroup
 from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
 
-from . import (DebugHCS08Applet, DebugHCS08Component, DebugHCS08Interface, HCS08Error,
-               _Command, _BIT_CYCLES, _RX_SAMPLE, _SYNC_RESPONSE,
+from . import (DebugHCS08Applet, DebugHCS08Component, DebugHCS08Interface, HCS08Error, BDCStatus,
+               _Command, _BDC, _BIT_CYCLES, _RX_SAMPLE, _SYNC_RESPONSE, _DVF_RETRIES,
                _TX_ONE_RELEASE, _TX_ZERO_HOLD, parse_srecord, coalesce)
+
+
+class _StubPipe:
+    """A pipe that records each flushed request and replays a scripted response for it."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self._pending = bytearray()
+        self._current = b""
+        self.sent = []
+
+    async def send(self, data):
+        self._pending += data
+
+    async def flush(self):
+        self.sent.append(bytes(self._pending))
+        self._pending = bytearray()
+        if not self._responses:
+            raise AssertionError(f"unexpected request #{len(self.sent)}: {self.sent[-1].hex()}")
+        self._current = self._responses.pop(0)
+
+    async def recv(self, length):
+        assert length == len(self._current), \
+            f"expected to read {len(self._current)} bytes, asked for {length}"
+        return self._current
 
 
 DIVISOR = 4 # sys clock cycles per simulated target BDC clock cycle
@@ -203,6 +231,68 @@ class DebugHCS08AppletTestCase(GlasgowAppletV2TestCase, applet=DebugHCS08Applet)
     def test_parse_srecord_rejects_empty(self):
         with self.assertRaises(HCS08Error):
             parse_srecord("S9030000FC\n")
+
+    # === DVF recovery ===
+    #
+    # DVF only arises when the BDC's bus-cycle steal loses a race with a running target CPU, which
+    # cannot be provoked on demand, so the recovery is exercised against a scripted pipe instead.
+
+    def _stub_interface(self, responses):
+        """An interface wired to a fake pipe replaying `responses`, recording what was sent."""
+        iface = object.__new__(DebugHCS08Interface)
+        iface._logger = py_logging.getLogger(__name__)
+        iface._level = py_logging.DEBUG
+        iface._divisor = 6
+        iface._pipe = _StubPipe(responses)
+        return iface
+
+    def test_dvf_read_is_reissued(self):
+        """A read reporting DVF is retried until it succeeds, and returns the retried data."""
+        iface = self._stub_interface([
+            bytes([BDCStatus.DVF, 0x00]),   # first attempt: access did not happen
+            bytes([BDCStatus.DVF, 0x00]),   # second attempt: still lost the race
+            bytes([0x00, 0xA5]),            # third attempt: succeeded
+        ])
+        value = asyncio.run(iface.read(0x1234, 1))
+        self.assertEqual(value, b"\xa5")
+        # Every attempt must re-send the original address, since READ_LAST cannot be used here.
+        self.assertEqual(len(iface._pipe.sent), 3)
+        for request in iface._pipe.sent:
+            self.assertEqual(request[1], _BDC.READ_BYTE_WS)
+            self.assertEqual(request[3], 0x12)
+            self.assertEqual(request[5], 0x34)
+
+    def test_dvf_write_is_not_reissued(self):
+        """A write reporting DVF is waited out with READ_STATUS, never repeated.
+
+        Reissuing would program a FLASH byte twice, which is forbidden without an erase.
+        """
+        iface = self._stub_interface([
+            bytes([BDCStatus.DVF]),  # the write itself: latched, but not yet complete
+            bytes([BDCStatus.DVF]),  # READ_STATUS: still outstanding
+            bytes([0x00]),           # READ_STATUS: latched write has completed
+        ])
+        asyncio.run(iface.write(0x1234, b"\xa5"))
+        opcodes = [request[1] for request in iface._pipe.sent]
+        self.assertEqual(opcodes, [_BDC.WRITE_BYTE_WS, _BDC.READ_STATUS, _BDC.READ_STATUS])
+        self.assertEqual(sum(1 for op in opcodes if op == _BDC.WRITE_BYTE_WS), 1)
+
+    def test_dvf_read_gives_up(self):
+        """Persistent DVF raises rather than looping forever."""
+        iface = self._stub_interface([bytes([BDCStatus.DVF, 0x00])] * (_DVF_RETRIES + 1))
+        with self.assertRaisesRegex(HCS08Error, "DVF"):
+            asyncio.run(iface.read(0x1234, 1))
+
+    def test_batch_retries_only_failed_accesses(self):
+        """Only the accesses that reported DVF are reissued, not the whole batch."""
+        first = bytes([0x00, 0x11]) + bytes([BDCStatus.DVF, 0x00]) + bytes([0x00, 0x33])
+        iface = self._stub_interface([first, bytes([0x00, 0x22])])
+        self.assertEqual(asyncio.run(iface.read(0x2000, 3)), b"\x11\x22\x33")
+        # The retry carries exactly one command, for the middle address only: opcode, two address
+        # bytes and a delay, each Transmit-prefixed, then two Receive opcodes.
+        retry = iface._pipe.sent[1]
+        self.assertEqual(len(retry), 9)
+        self.assertEqual((retry[1], retry[3], retry[5]), (_BDC.READ_BYTE_WS, 0x20, 0x01))
 
     def test_coalesce(self):
         self.assertEqual(
