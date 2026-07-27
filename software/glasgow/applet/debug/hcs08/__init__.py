@@ -385,6 +385,18 @@ FCMD_MASS_ERASE    = 0x41
 
 FLASH_PAGE_SIZE = 512
 
+# Nonvolatile registers, copied into their working counterparts at reset; see MC9S08AW60 §4.5.
+NVPROT_addr = 0xFFBD
+NVOPT_addr  = 0xFFBF
+
+# SEC01:SEC00 in FOPT/NVOPT. Only 1:0 disengages security; the other three combinations, including
+# the erased state 1:1, engage it.
+SEC_MASK      = 0b11
+SEC_UNSECURED = 0b10
+# Erased NVOPT with SEC00 cleared. Programming can only clear bits, so this is the least that turns
+# a freshly erased 0xFF into the unsecured state.
+NVOPT_UNSECURED = 0xFE
+
 # BDC commands pipelined into one USB transfer by `_burst`. Each memory access returns 2 bytes,
 # so this keeps at most 256 bytes of response in flight, comfortably inside one 512-byte FX2 IN
 # endpoint buffer. Larger batches buy nothing: past a few dozen commands the USB round trip is
@@ -896,6 +908,62 @@ class DebugHCS08Interface:
         await self.flash_unprotect()
         await self._flash_command(0xFFFE, 0xFF, FCMD_MASS_ERASE, timeout=10000)
 
+    async def is_secured(self) -> bool:
+        """Whether FLASH and RAM are currently closed to background debug access.
+
+        Reads ``FOPT``, a high-page register, which stays readable while the part is secured --
+        security covers FLASH and RAM, but leaves the registers and the BDC accessible.
+        """
+        fopt = await self.read_byte(FOPT_addr)
+        return (fopt & SEC_MASK) != SEC_UNSECURED
+
+    async def flash_blank_check(self) -> bool:
+        """Verify that the entire FLASH array is erased.
+
+        A successful blank check also disengages security until the next reset (MC9S08AW60 §4.5),
+        which is the only thing that makes a secured part recoverable; see :meth:`unsecure`.
+        """
+        await self._flash_command(0xFFFE, 0xFF, FCMD_BLANK_CHECK, timeout=10000)
+        # FBLANK is only meaningful once the command completes, and is cleared again by launching
+        # the next one, so it has to be sampled here rather than inferred later.
+        fstat = await self.read_byte(FSTAT_addr)
+        blank = bool(fstat & FSTAT_FBLANK)
+        self._log(f"flash blank check FSTAT={fstat:#04x} blank={blank}")
+        return blank
+
+    async def unsecure(self, *, bus_frequency: float | None = None,
+                       nvopt: int = NVOPT_UNSECURED):
+        """Disengage FLASH security, erasing the entire array in the process.
+
+        A secured part cannot be unlocked in place. The backdoor key at ``NVBACKKEY`` is not a way
+        in over this interface: it can only be entered by code already executing from secure
+        memory, never through background debug commands, and it is disabled outright when
+        ``KEYEN`` is 0. The only remaining route, per MC9S08AW60 §4.5, is to erase everything and
+        prove it: drop block protection, mass erase, then blank check, which disengages security
+        until the next reset. ``NVOPT`` is then programmed so the part stays unsecured afterwards.
+
+        The order is forced by the hardware: while the part is secure the BDC may issue only blank
+        check and mass erase, so ``NVOPT`` cannot be programmed until the blank check has already
+        taken effect.
+
+        This destroys the contents of FLASH, including the interrupt vectors. It is a recovery
+        mechanism, not a debugging convenience.
+        """
+        self._log("unsecure: erasing FLASH to disengage security")
+        await self.flash_init(bus_frequency)
+        # FPROT can only be written over the debug interface, never from application software.
+        await self.flash_unprotect()
+        await self.flash_mass_erase()
+        if not await self.flash_blank_check():
+            raise HCS08Error("FLASH is not blank after a mass erase, so security cannot be "
+                             "disengaged; the array may be partly block protected")
+        assert nvopt & SEC_MASK == SEC_UNSECURED, "nvopt must select the unsecured state"
+        await self.flash_program(NVOPT_addr, bytes([nvopt]))
+        if (await self.read(NVOPT_addr, 1))[0] != nvopt:
+            raise HCS08Error(f"failed to program NVOPT to {nvopt:#04x}; the part would return to "
+                             f"the secured state at the next reset")
+        self._log(f"unsecure: NVOPT={nvopt:#04x}, part is unsecured across resets")
+
     async def flash_page_erase(self, address: int):
         """Erase the 512-byte FLASH page containing ``address``."""
         self._log(f"flash page erase {address:#06x}")
@@ -1083,6 +1151,10 @@ class DebugHCS08Applet(GlasgowAppletV2):
             "erase", help="mass erase the FLASH array")
         add_bus_frequency_argument(p_erase)
 
+        p_unsecure = p_operation.add_parser(
+            "unsecure", help="erase the FLASH array to disengage security")
+        add_bus_frequency_argument(p_unsecure)
+
         p_program = p_operation.add_parser(
             "program", help="erase and program FLASH from an S-record file")
         p_program.add_argument(
@@ -1145,6 +1217,17 @@ class DebugHCS08Applet(GlasgowAppletV2):
                 await iface.flash_init(bus_frequency)
                 await iface.flash_mass_erase()
                 self.logger.info("FLASH mass erased")
+                # An erased NVOPT reads 0xFF, i.e. SEC01:SEC00 = 1:1, which is the secured state.
+                self.logger.warning("FLASH is erased, so the target will come up SECURED at its "
+                                    "next reset; program NVOPT, or recover with `unsecure`")
+
+            case "unsecure":
+                await iface.enable_bdm()
+                if not await iface.is_secured():
+                    self.logger.info("target is not secured; erasing anyway to reach a known "
+                                     "state")
+                await iface.unsecure(bus_frequency=bus_frequency)
+                self.logger.info("FLASH erased and security disengaged")
 
             case "program":
                 chunks = coalesce(parse_srecord(args.file.read()))

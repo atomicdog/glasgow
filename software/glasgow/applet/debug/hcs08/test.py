@@ -10,7 +10,8 @@ from glasgow.applet import (GlasgowAppletV2TestCase, synthesis_test, applet_v2_h
 
 from . import (DebugHCS08Applet, DebugHCS08Component, DebugHCS08Interface, HCS08Error, BDCStatus,
                _Command, _BDC, _BIT_CYCLES, _RX_SAMPLE, _SYNC_RESPONSE, _DVF_RETRIES,
-               _TX_ONE_RELEASE, _TX_ZERO_HOLD, parse_srecord, coalesce)
+               _TX_ONE_RELEASE, _TX_ZERO_HOLD, parse_srecord, coalesce,
+               FCMD_addr, FCMD_MASS_ERASE, FCMD_BLANK_CHECK, FCMD_BURST_PROGRAM)
 
 
 class _StubPipe:
@@ -415,6 +416,74 @@ class DebugHCS08AppletTestCase(GlasgowAppletV2TestCase, applet=DebugHCS08Applet)
         retry = iface._pipe.sent[1]
         self.assertEqual(len(retry), 9)
         self.assertEqual((retry[1], retry[3], retry[5]), (_BDC.READ_BYTE_WS, 0x20, 0x01))
+
+    # === FLASH security ===
+
+    # FSTAT with the command buffer empty and the last command complete.
+    _IDLE = 0xC0
+
+    def _blank_check_responses(self, fstat_final):
+        """Scripted replies for one `flash_blank_check`, ending with `fstat_final`."""
+        return [
+            bytes([0x00, self._IDLE]),   # _flash_clear_errors: no error flags set
+            bytes([0x00, self._IDLE]),   # _flash_ready: FCBEF set
+            bytes([0x00, 0x00, 0x00]),   # the three latching writes, batched
+            bytes([0x00, fstat_final]),  # _flash_wait: FCCF set
+            bytes([0x00, fstat_final]),  # the FBLANK sample
+        ]
+
+    def test_flash_blank_check_erased(self):
+        iface = self._stub_interface(self._blank_check_responses(self._IDLE | 0x04))
+        self.assertTrue(asyncio.run(iface.flash_blank_check()))
+        # The blank check command code must be the one the BDC accepts while secured.
+        launch = iface._pipe.sent[2]
+        self.assertIn(0x05, launch)
+
+    def test_flash_blank_check_not_erased(self):
+        iface = self._stub_interface(self._blank_check_responses(self._IDLE))
+        self.assertFalse(asyncio.run(iface.flash_blank_check()))
+
+    def _mass_erase_responses(self):
+        return [
+            bytes([0x00]),               # flash_unprotect, called again by flash_mass_erase
+            bytes([0x00, self._IDLE]),   # _flash_clear_errors
+            bytes([0x00, self._IDLE]),   # _flash_ready
+            bytes([0x00, 0x00, 0x00]),   # the three latching writes, batched
+            bytes([0x00, self._IDLE]),   # _flash_wait
+        ]
+
+    def test_unsecure_refuses_when_not_blank(self):
+        """If the array does not verify blank, security has not been disengaged."""
+        iface = self._stub_interface([
+            bytes([0x00, 0x80]),                        # flash_init: FCDIV already loaded (DIVLD)
+            bytes([0x00]),                              # flash_unprotect
+            *self._mass_erase_responses(),
+            *self._blank_check_responses(self._IDLE),   # FBLANK clear: not erased
+        ])
+        with self.assertRaisesRegex(HCS08Error, "not blank"):
+            asyncio.run(iface.unsecure())
+        # NVOPT must not have been touched: while the part is still secured the BDC accepts only
+        # blank check and mass erase, so launching a burst program would merely set FACCERR.
+        traffic = b"".join(iface._pipe.sent)
+        self.assertIn(self._write_of(FCMD_addr, FCMD_MASS_ERASE), traffic)
+        self.assertIn(self._write_of(FCMD_addr, FCMD_BLANK_CHECK), traffic)
+        self.assertNotIn(self._write_of(FCMD_addr, FCMD_BURST_PROGRAM), traffic)
+
+    @staticmethod
+    def _write_of(address, value):
+        """The gateware opcodes for one WRITE_BYTE_WS of `value` to `address`."""
+        return bytes([_Command.Transmit.value, _BDC.WRITE_BYTE_WS,
+                      _Command.Transmit.value, (address >> 8) & 0xFF,
+                      _Command.Transmit.value, address & 0xFF,
+                      _Command.Transmit.value, value])
+
+    def test_nvopt_constant_selects_unsecured_state(self):
+        """The NVOPT written by `unsecure` must decode to SEC01:SEC00 = 1:0."""
+        from . import NVOPT_UNSECURED, SEC_MASK, SEC_UNSECURED
+        self.assertEqual(NVOPT_UNSECURED & SEC_MASK, SEC_UNSECURED)
+        # Programming can only clear bits, so it has to be reachable from the erased state.
+        self.assertEqual(NVOPT_UNSECURED & 0xFF, NVOPT_UNSECURED)
+        self.assertEqual(NVOPT_UNSECURED | 0xFF, 0xFF)
 
     def test_coalesce(self):
         self.assertEqual(
