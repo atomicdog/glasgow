@@ -1053,7 +1053,6 @@ def coalesce(memory: dict[int, int]) -> list[tuple[int, bytes]]:
 
 
 class DebugHCS08Applet(GlasgowAppletV2):
-    preview = True
     logger = logging.getLogger(__name__)
     help = "program and debug Freescale/NXP HCS08 MCUs via BDM"
     description = """
@@ -1072,6 +1071,15 @@ class DebugHCS08Applet(GlasgowAppletV2):
     be clocked between 150 and 200 kHz. It is normally derived from the recovered BDC clock, which
     is valid whenever the BDC is clocked from the bus (as it is after --reset-into-bdm); pass
     --bus-frequency to override that, or if the target selects the alternate BDC clock source.
+
+    Erasing FLASH leaves NVOPT erased as well, which selects the secured state, so a target that
+    is erased and then reset will refuse access until it is erased again; `program` is unaffected
+    because it erases and reprograms within a single session, and `unsecure` recovers a target
+    that has locked itself this way.
+
+    The BDC is common to the HCS08 family, but the FLASH command interface and memory map have
+    been verified only against the MC9S08AW60. Other derivatives are expected to work; check the
+    FLASH register addresses in their data sheet before programming one.
     """
     # BKGD is a pseudo-open-drain signal; the revA/B level shifters interfere with it.
     required_revision = "C0"
