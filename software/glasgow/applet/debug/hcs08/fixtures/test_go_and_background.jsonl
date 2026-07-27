@@ -1,0 +1,47 @@
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [[6, 0]], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [[5, 0]], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [[5, 1]], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [[6, 2]], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [[1]], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "recv", "kind": "asyncmethod", "args": [2], "kwargs": {}, "result": {"__class__": "memoryview", "hex": "f105"}}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "000c00"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "02d604"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytearray", "hex": "02c10218020202020403"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "recv", "kind": "asyncmethod", "args": [1], "kwargs": {}, "result": {"__class__": "memoryview", "hex": "c8"}}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytearray", "hex": "02c10204020002a6040302c102040201025a040302c10204020202ab040302c1020402030203040302c10204020402c7040302c1020402050204040302c1020402060220040302c1020402070220040302c10204020802fe0403"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "recv", "kind": "asyncmethod", "args": [9], "kwargs": {}, "result": {"__class__": "memoryview", "hex": "c8c8c8c8c8c8c8c8c8"}}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytearray", "hex": "02c10204022002000403"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "recv", "kind": "asyncmethod", "args": [1], "kwargs": {}, "result": {"__class__": "memoryview", "hex": "c8"}}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "024b0204020004"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "0248020004"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "02e403"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "recv", "kind": "asyncmethod", "args": [1], "kwargs": {}, "result": {"__class__": "memoryview", "hex": "c8"}}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "020804"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "02e403"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "recv", "kind": "asyncmethod", "args": [1], "kwargs": {}, "result": {"__class__": "memoryview", "hex": "88"}}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "029004"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "02e403"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "recv", "kind": "asyncmethod", "args": [1], "kwargs": {}, "result": {"__class__": "memoryview", "hex": "c8"}}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytes", "hex": "026b040303"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "recv", "kind": "asyncmethod", "args": [2], "kwargs": {}, "result": {"__class__": "memoryview", "hex": "0407"}}
+{"self": "hcs08_iface._pipe", "call": "send", "kind": "asyncmethod", "args": [{"__class__": "bytearray", "hex": "02e102040220040303"}], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "flush", "kind": "asyncmethod", "args": [], "kwargs": {}, "result": null}
+{"self": "hcs08_iface._pipe", "call": "recv", "kind": "asyncmethod", "args": [2], "kwargs": {}, "result": {"__class__": "memoryview", "hex": "c85d"}}

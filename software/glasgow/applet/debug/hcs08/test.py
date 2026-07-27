@@ -6,7 +6,7 @@ from amaranth.lib import io
 from amaranth.sim import Simulator
 
 from glasgow.gateware.ports import PortGroup
-from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
+from glasgow.applet import (GlasgowAppletV2TestCase, synthesis_test, applet_v2_hardware_test)
 
 from . import (DebugHCS08Applet, DebugHCS08Component, DebugHCS08Interface, HCS08Error, BDCStatus,
                _Command, _BDC, _BIT_CYCLES, _RX_SAMPLE, _SYNC_RESPONSE, _DVF_RETRIES,
@@ -39,6 +39,36 @@ class _StubPipe:
 
 
 DIVISOR = 4 # sys clock cycles per simulated target BDC clock cycle
+
+# Recorded against an MC9S08AW60 with BKGD on A0 and RESET on A1, Glasgow supplying 3.3 V.
+HW_ARGS = "-V A=3.3 --bkgd A0 --reset A1"
+
+# A scratch program executed from RAM, so the run-control tests do not depend on whatever firmware
+# happens to be resident:
+#   0400  A6 5A     LDA  #$5A
+#   0402  AB 03     ADD  #$03        -> A = 0x5D
+#   0404  C7 04 20  STA  $0420       -> observable side effect
+#   0407  20 FE     BRA  *           -> spin
+CODE_ADDR = 0x0400
+CODE      = bytes([0xA6, 0x5A, 0xAB, 0x03, 0xC7, 0x04, 0x20, 0x20, 0xFE])
+SPIN_ADDR = 0x0407
+STA_ADDR  = 0x0404
+RESULT_ADDR = 0x0420
+SOPT_addr = 0x1802
+
+
+async def _halt_and_load(iface):
+    """Halt the target, defuse the watchdog, and load the scratch program into RAM."""
+    # `setup` does not run in replay mode, so the bit timing has to be established here, inside
+    # the recorded region, rather than relied upon from the applet's own setup.
+    await iface.reset_into_bdm()
+    await iface.ack_disable()
+    # SOPT resets with the COP watchdog enabled, which would reset the part part-way through a GO.
+    # COPE is write-once per reset so this only lands before the firmware runs, and bit 1 (BKGDPE)
+    # must stay set or the BKGD pin stops responding altogether.
+    await iface.write_byte(SOPT_addr, 0x02)
+    await iface.write(CODE_ADDR, CODE)
+    await iface.write_byte(RESULT_ADDR, 0x00)
 
 
 class _Harness(Elaboratable):
@@ -231,6 +261,98 @@ class DebugHCS08AppletTestCase(GlasgowAppletV2TestCase, applet=DebugHCS08Applet)
     def test_parse_srecord_rejects_empty(self):
         with self.assertRaises(HCS08Error):
             parse_srecord("S9030000FC\n")
+
+    # === Hardware tests (recorded against an MC9S08AW60) ===
+
+    @applet_v2_hardware_test(mocks=["hcs08_iface._pipe"], args=HW_ARGS)
+    async def test_cpu_registers(self, applet: DebugHCS08Applet):
+        iface = applet.hcs08_iface
+        await iface.reset_into_bdm()
+        await iface.ack_disable()
+
+        # Resetting into active background mode enables BDM and clocks the BDC from the bus.
+        status = await iface.read_status()
+        assert status.bdmact and status.enbdm and status.clksw, status
+
+        await iface.write_a(0x3C)
+        await iface.write_hx(0x1234)
+        await iface.write_sp(0x085F)
+        await iface.write_pc(0x1881)
+        await iface.write_ccr(0x08)
+
+        assert await iface.read_a() == 0x3C
+        assert await iface.read_hx() == 0x1234
+        assert await iface.read_sp() == 0x085F
+        assert await iface.read_pc() == 0x1881
+        # CCR bits 6 and 5 are permanently 1 (MC9S08AW60 §7.2.5), so 0x08 reads back as 0x68.
+        assert await iface.read_ccr() == 0x68
+
+    @applet_v2_hardware_test(mocks=["hcs08_iface._pipe"], args=HW_ARGS)
+    async def test_single_step(self, applet: DebugHCS08Applet):
+        iface = applet.hcs08_iface
+        await _halt_and_load(iface)
+        assert await iface.read(CODE_ADDR, len(CODE)) == CODE
+
+        await iface.write_pc(CODE_ADDR)
+        await iface.write_a(0x00)
+
+        await iface.trace1() # LDA #$5A
+        assert await iface.read_pc() == 0x0402
+        assert await iface.read_a() == 0x5A
+
+        await iface.trace1() # ADD #$03
+        assert await iface.read_pc() == STA_ADDR
+        assert await iface.read_a() == 0x5D
+
+        # The store must not have happened yet: this is what distinguishes stepping from running.
+        assert await iface.read_byte(RESULT_ADDR) == 0x00
+        await iface.trace1() # STA $0420
+        assert await iface.read_pc() == SPIN_ADDR
+        assert await iface.read_byte(RESULT_ADDR) == 0x5D
+
+    @applet_v2_hardware_test(mocks=["hcs08_iface._pipe"], args=HW_ARGS)
+    async def test_go_and_background(self, applet: DebugHCS08Applet):
+        iface = applet.hcs08_iface
+        await _halt_and_load(iface)
+        await iface.write_pc(CODE_ADDR)
+        await iface.write_a(0x00)
+
+        assert (await iface.read_status()).bdmact
+        await iface.go()
+        assert not (await iface.read_status()).bdmact
+
+        await iface.background()
+        assert (await iface.read_status()).bdmact
+        # The program runs to its spin loop and leaves its side effect behind.
+        assert await iface.read_pc() == SPIN_ADDR
+        assert await iface.read_byte(RESULT_ADDR) == 0x5D
+
+    @applet_v2_hardware_test(mocks=["hcs08_iface._pipe"], args=HW_ARGS)
+    async def test_hardware_breakpoint(self, applet: DebugHCS08Applet):
+        iface = applet.hcs08_iface
+        await _halt_and_load(iface)
+
+        await iface.write_bkpt(STA_ADDR)
+        assert await iface.read_bkpt() == STA_ADDR
+        # FTS clear selects tag mode, which enters background mode *before* executing the opcode
+        # at the match address rather than at the next instruction boundary.
+        await iface.write_control(BDCStatus.ENBDM | BDCStatus.BKPTEN | BDCStatus.CLKSW)
+        assert (await iface.read_status()) & BDCStatus.BKPTEN
+
+        await iface.write_pc(CODE_ADDR)
+        await iface.write_a(0x00)
+        await iface.go()
+        for _ in range(100): # bounded so a fixture recorded elsewhere fails rather than hangs
+            if (await iface.read_status()).bdmact:
+                break
+        else:
+            raise AssertionError("breakpoint did not halt the CPU")
+
+        assert await iface.read_pc() == STA_ADDR
+        assert await iface.read_a() == 0x5D # the two instructions before the breakpoint ran
+        assert await iface.read_byte(RESULT_ADDR) == 0x00 # the tagged store did not
+
+        await iface.write_control(BDCStatus.ENBDM | BDCStatus.CLKSW)
 
     # === DVF recovery ===
     #
