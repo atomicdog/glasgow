@@ -15,10 +15,12 @@
 # the gateware works in units of target BDC cycles throughout, with `divisor` giving the number of
 # sys clock cycles per target BDC cycle.
 
+import re
 import enum as py_enum
 import struct
 import asyncio
 import argparse
+import subprocess
 
 from amaranth import *
 from amaranth.lib import io, cdc, enum, wiring, stream
@@ -29,7 +31,7 @@ from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletV2, GlasgowAppletError
 
 
-__all__ = ["DebugHCS08Interface", "HCS08Error", "BDCStatus"]
+__all__ = ["DebugHCS08Interface", "HCS08Error", "BDCStatus", "LLVMDisassembler"]
 
 
 class _Command(enum.Enum, shape=8):
@@ -1075,6 +1077,94 @@ def coalesce(memory: dict[int, int]) -> list[tuple[int, bytes]]:
     return [(address, bytes(data)) for address, data in chunks]
 
 
+# Mnemonics whose last operand is a PC-relative branch target. Taken from the instructions built
+# on the `brtarget2/3/4` (OPERAND_PCREL) operands of the out-of-tree LLVM HCS08 backend, which is
+# every relative-mode instruction in HCS08RMV1. `blo` and `bhs` are parser-side aliases of `bcs`
+# and `bcc`, so the disassembler never prints them.
+_PCREL_MNEMONICS = frozenset({
+    "bra", "brn", "bhi", "bls", "bcc", "bcs", "bne", "beq", "bhcc", "bhcs", "bpl", "bmi",
+    "bmc", "bms", "bil", "bih", "bge", "blt", "bgt", "ble", "bsr", "brset", "brclr",
+    "cbeq", "cbeqa", "cbeqx", "dbnz", "dbnza", "dbnzx",
+})
+
+# The widest HCS08 instruction is four bytes (the 0x9E-prefixed indexed-with-offset forms), so a
+# window this size always holds the whole instruction at the PC.
+MAX_INSN_BYTES = 4
+
+_HEX_OPERAND = re.compile(r"\$([0-9a-fA-F]+)")
+
+
+def fixup_branch_target(text: str, address: int) -> str:
+    """Rebase the PC-relative operand of one disassembled instruction onto ``address``.
+
+    ``llvm-mc --disassemble`` cannot be told where the bytes it decodes actually live, so it
+    resolves branch displacements against address 0. The displacement is measured from the end of
+    the instruction either way, so the instruction's own length cancels out and the true target is
+    just the printed one plus the address the instruction was fetched from, modulo the 64K address
+    space. Every other HCS08 addressing mode is immediate or absolute and needs no correction.
+    """
+    mnemonic, _, operands = text.partition("\t") if "\t" in text else text.partition(" ")
+    mnemonic, operands = mnemonic.strip(), operands.strip()
+    normalized = f"{mnemonic} {operands}".strip()
+    if mnemonic.lower() not in _PCREL_MNEMONICS:
+        return normalized
+    # The relative displacement is the last operand of every relative-mode instruction, whether it
+    # is the only one (`bra $0400`) or follows a bit number and a direct address (`brset 0,$50,…`).
+    if not (matches := list(_HEX_OPERAND.finditer(operands))):
+        return normalized
+    last = matches[-1]
+    target = (int(last.group(1), 16) + address) & 0xFFFF
+    return f"{mnemonic} {operands[:last.start()]}${target:04x}{operands[last.end():]}"
+
+
+class LLVMDisassembler:
+    """Disassembles HCS08 instructions by shelling out to ``llvm-mc``.
+
+    The HCS08 target is not part of upstream LLVM, so this needs an ``llvm-mc`` built from a tree
+    carrying the out-of-tree HCS08 backend. It is entirely optional: nothing else in this applet
+    depends on it, and the applet is fully usable without one.
+    """
+
+    def __init__(self, executable: str = "llvm-mc", *, triple: str = "hcs08"):
+        self._executable = executable
+        self._triple = triple
+
+    def check(self):
+        """Verify that the tool runs and has the HCS08 target, raising :class:`HCS08Error` if not.
+
+        Worth doing before a long trace, so that a missing tool is reported up front rather than
+        after the target has already been stepped some way into the program.
+        """
+        try:
+            result = subprocess.run([self._executable, "--version"],
+                                    capture_output=True, text=True, timeout=10)
+        except FileNotFoundError:
+            raise HCS08Error(f"{self._executable!r} not found; disassembly needs an llvm-mc built "
+                             f"with the out-of-tree HCS08 backend") from None
+        except OSError as error:
+            raise HCS08Error(f"could not run {self._executable!r}: {error}") from None
+        if not re.search(rf"^\s*{re.escape(self._triple)}\s", result.stdout, re.MULTILINE):
+            raise HCS08Error(f"{self._executable!r} has no {self._triple!r} target registered; "
+                             f"it must be built with the out-of-tree HCS08 backend")
+
+    def disassemble(self, address: int, code: bytes) -> str | None:
+        """Disassemble the first instruction in ``code``, which was fetched from ``address``.
+
+        ``code`` may run past the end of that instruction, since its length is not known until it
+        has been decoded; anything after the first instruction is discarded. Returns :py:`None` if
+        the bytes do not decode.
+        """
+        result = subprocess.run(
+            [self._executable, f"-triple={self._triple}", "--disassemble"],
+            input=" ".join(f"0x{byte:02x}" for byte in code),
+            capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            # Assembler directives (`.text`) and comments carry no instruction.
+            if (line := line.strip()) and not line.startswith((".", "#")):
+                return fixup_branch_target(line, address)
+        return None
+
+
 class DebugHCS08Applet(GlasgowAppletV2):
     logger = logging.getLogger(__name__)
     help = "program and debug Freescale/NXP HCS08 MCUs via BDM"
@@ -1161,6 +1251,13 @@ class DebugHCS08Applet(GlasgowAppletV2):
         p_step.add_argument(
             "count", metavar="COUNT", type=count, nargs="?", default=1,
             help="number of instructions to execute (default: %(default)s)")
+        p_step.add_argument(
+            "-d", "--disassemble", default=False, action="store_true",
+            help="show the instruction executed by each step (requires an llvm-mc built with "
+                 "the out-of-tree HCS08 backend)")
+        p_step.add_argument(
+            "--llvm-mc", metavar="PATH", default=None,
+            help="llvm-mc executable to disassemble with (default: llvm-mc; implies -d)")
 
         p_read = p_operation.add_parser(
             "read", help="read target memory")
@@ -1243,11 +1340,28 @@ class DebugHCS08Applet(GlasgowAppletV2):
                 # instruction the halt happened to catch; that is `halt`'s job to do explicitly.
                 if not (await iface.read_status()).bdmact:
                     raise HCS08Error("target is running; use `halt` to stop it before stepping")
+                disassembler = None
+                if args.disassemble or args.llvm_mc is not None:
+                    disassembler = LLVMDisassembler(args.llvm_mc or "llvm-mc")
+                    disassembler.check()
+                    # Each instruction is disassembled from the PC it is fetched at, so the trace
+                    # reads as cause and effect. Only this first PC has to be read from the
+                    # target; every later one is the PC the preceding step landed on.
+                    pc = await iface.read_pc()
                 for _ in range(args.count):
-                    registers = await iface.step()
-                    self.logger.info("stepped to PC=%04X SP=%04X H:X=%04X A=%02X CCR=%02X",
-                                     registers["PC"], registers["SP"], registers["H:X"],
-                                     registers["A"], registers["CCR"])
+                    if disassembler is None:
+                        registers = await iface.step()
+                        self.logger.info("stepped to PC=%04X SP=%04X H:X=%04X A=%02X CCR=%02X",
+                                         registers["PC"], registers["SP"], registers["H:X"],
+                                         registers["A"], registers["CCR"])
+                    else:
+                        window = await iface.read(pc, min(MAX_INSN_BYTES, 0x10000 - pc))
+                        text = disassembler.disassemble(pc, window) or "(undecodable)"
+                        registers = await iface.step()
+                        self.logger.info("%04X  %-22s -> PC=%04X SP=%04X H:X=%04X A=%02X CCR=%02X",
+                                         pc, text, registers["PC"], registers["SP"],
+                                         registers["H:X"], registers["A"], registers["CCR"])
+                        pc = registers["PC"]
 
             case "read":
                 data = await iface.read(args.address, args.length)

@@ -11,7 +11,8 @@ from glasgow.applet import (GlasgowAppletV2TestCase, synthesis_test, applet_v2_h
 from . import (DebugHCS08Applet, DebugHCS08Component, DebugHCS08Interface, HCS08Error, BDCStatus,
                _Command, _BDC, _BIT_CYCLES, _RX_SAMPLE, _SYNC_RESPONSE, _DVF_RETRIES,
                _TX_ONE_RELEASE, _TX_ZERO_HOLD, parse_srecord, coalesce,
-               FCMD_addr, FCMD_MASS_ERASE, FCMD_BLANK_CHECK, FCMD_BURST_PROGRAM)
+               FCMD_addr, FCMD_MASS_ERASE, FCMD_BLANK_CHECK, FCMD_BURST_PROGRAM,
+               LLVMDisassembler, fixup_branch_target)
 
 
 class _StubPipe:
@@ -498,6 +499,56 @@ class DebugHCS08AppletTestCase(GlasgowAppletV2TestCase, applet=DebugHCS08Applet)
         with self.assertRaisesRegex(HCS08Error, "did not return to active background mode"):
             asyncio.run(iface.step())
         self.assertEqual(len(iface._pipe.sent), 3)
+
+    # === Disassembly ===
+    #
+    # `llvm-mc` needs an out-of-tree HCS08 backend, so it cannot be a test dependency. What is
+    # tested here is the part that is ours: rebasing the branch target llvm-mc resolves against
+    # address 0. The sample output strings below were produced by a real `llvm-mc -triple=hcs08
+    # --disassemble` run over the corresponding encodings.
+
+    def test_fixup_leaves_absolute_operands_alone(self):
+        """Immediate, direct and extended operands mean the same wherever the instruction is."""
+        for text, expected in (
+            ("lda\t#$5a",    "lda #$5a"),
+            ("sta\t$0420",   "sta $0420"),
+            ("bset\t3,$50",  "bset 3,$50"),
+            ("nop",          "nop"),
+        ):
+            self.assertEqual(fixup_branch_target(text, 0x0407), expected)
+
+    def test_fixup_ignores_non_relative_b_mnemonics(self):
+        """`bit`, `bset` and `bclr` start with a b but are not relative-mode instructions."""
+        self.assertEqual(fixup_branch_target("bit\t#$0004", 0x0400), "bit #$0004")
+        self.assertEqual(fixup_branch_target("bclr\t0,$04", 0x0400), "bclr 0,$04")
+
+    def test_fixup_rebases_branch_target(self):
+        """A branch target is the printed one plus the address the instruction was fetched at."""
+        # BRA * (20 FE) at 0x0407 branches to itself; llvm-mc resolves it against address 0.
+        self.assertEqual(fixup_branch_target("bra\t$0000", 0x0407), "bra $0407")
+        # 20 02, a two-byte forward branch: 0x0400 + 2 + 2.
+        self.assertEqual(fixup_branch_target("bra\t$0004", 0x0400), "bra $0404")
+
+    def test_fixup_wraps_backward_branch(self):
+        """A backward branch decodes as a negative displacement and must wrap within 64K."""
+        # 20 F0 at 0x0407: 0x0407 + 2 - 16 = 0x03F9, which is 0xFFF2 + 0x0407 truncated to 16 bits.
+        self.assertEqual(fixup_branch_target("bra\t$fff2", 0x0407), "bra $03f9")
+        # A forward branch near the top of memory wraps the other way.
+        self.assertEqual(fixup_branch_target("bra\t$0004", 0xFFFE), "bra $0002")
+
+    def test_fixup_rebases_only_the_last_operand(self):
+        """The displacement is the last operand; the direct address before it must not move."""
+        self.assertEqual(
+            fixup_branch_target("brset\t0,$50,$0004", 0x0400), "brset 0,$50,$0404")
+        self.assertEqual(
+            fixup_branch_target("dbnz\t$50,$0004", 0x0400), "dbnz $50,$0404")
+        # An indexed form whose only hexadecimal operand is the target.
+        self.assertEqual(fixup_branch_target("cbeq\t,x+,$0004", 0x0400), "cbeq ,x+,$0404")
+
+    def test_disassembler_reports_a_missing_tool(self):
+        """A missing llvm-mc is a clear error, not a traceback."""
+        with self.assertRaisesRegex(HCS08Error, "not found"):
+            LLVMDisassembler("llvm-mc-that-does-not-exist").check()
 
     # === FLASH security ===
 
