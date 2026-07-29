@@ -312,6 +312,30 @@ class DebugHCS08AppletTestCase(GlasgowAppletV2TestCase, applet=DebugHCS08Applet)
         assert await iface.read_byte(RESULT_ADDR) == 0x5D
 
     @applet_v2_hardware_test(mocks=["hcs08_iface._pipe"], args=HW_ARGS)
+    async def test_step_wrapper(self, applet: DebugHCS08Applet):
+        """`step` traces one instruction and reports the state it lands in, on real silicon."""
+        iface = applet.hcs08_iface
+        await _halt_and_load(iface)
+        await iface.write_pc(CODE_ADDR)
+        await iface.write_a(0x00)
+
+        registers = await iface.step() # LDA #$5A
+        assert registers["PC"] == 0x0402 and registers["A"] == 0x5A, registers
+
+        registers = await iface.step() # ADD #$03
+        assert registers["PC"] == STA_ADDR and registers["A"] == 0x5D, registers
+
+        # The store must not have happened yet: this is what distinguishes stepping from running.
+        assert await iface.read_byte(RESULT_ADDR) == 0x00
+        registers = await iface.step() # STA $0420
+        assert registers["PC"] == SPIN_ADDR, registers
+        assert await iface.read_byte(RESULT_ADDR) == 0x5D
+
+        # BRA * branches to itself, so stepping the spin loop leaves the PC where it was.
+        registers = await iface.step()
+        assert registers["PC"] == SPIN_ADDR, registers
+
+    @applet_v2_hardware_test(mocks=["hcs08_iface._pipe"], args=HW_ARGS)
     async def test_go_and_background(self, applet: DebugHCS08Applet):
         iface = applet.hcs08_iface
         await _halt_and_load(iface)
@@ -416,6 +440,64 @@ class DebugHCS08AppletTestCase(GlasgowAppletV2TestCase, applet=DebugHCS08Applet)
         retry = iface._pipe.sent[1]
         self.assertEqual(len(retry), 9)
         self.assertEqual((retry[1], retry[3], retry[5]), (_BDC.READ_BYTE_WS, 0x20, 0x01))
+
+    # === Single stepping ===
+    #
+    # `trace1` is covered against real silicon by `test_single_step`; what is scripted here is the
+    # bookkeeping `step` wraps around it, including the failure paths that hardware will not
+    # produce on demand.
+
+    _ACTIVE = BDCStatus.ENBDM | BDCStatus.BDMACT
+
+    def test_step_reports_registers(self):
+        """A step checks for active background mode, traces one instruction, then reads out."""
+        iface = self._stub_interface([
+            bytes([self._ACTIVE]),  # the target is halted, so stepping is permitted
+            b"",                    # TRACE1 returns nothing of its own
+            bytes([self._ACTIVE]),  # the instruction retired back into background mode
+            b"\x04\x02",            # PC
+            b"\x08\x5f",            # SP
+            b"\x12\x34",            # H:X
+            b"\x5a",                # A
+            b"\x68",                # CCR
+        ])
+        registers = asyncio.run(iface.step())
+        self.assertEqual(registers, {
+            "PC": 0x0402, "SP": 0x085F, "H:X": 0x1234, "A": 0x5A, "CCR": 0x68,
+        })
+        self.assertEqual([request[1] for request in iface._pipe.sent], [
+            _BDC.READ_STATUS, _BDC.TRACE1, _BDC.READ_STATUS,
+            _BDC.READ_PC, _BDC.READ_SP, _BDC.READ_HX, _BDC.READ_A, _BDC.READ_CCR,
+        ])
+
+    def test_step_requires_active_background_mode(self):
+        """A running target is refused rather than stepped, since TRACE1 would be ignored."""
+        iface = self._stub_interface([bytes([BDCStatus.ENBDM])])
+        with self.assertRaisesRegex(HCS08Error, "not in active background mode"):
+            asyncio.run(iface.step())
+        # The refusal happens before TRACE1 is sent, not after.
+        self.assertEqual([request[1] for request in iface._pipe.sent], [_BDC.READ_STATUS])
+
+    def test_step_detects_wait_or_stop(self):
+        """Stepping a WAIT or STOP puts the CPU beyond the BDC's reach, and says so."""
+        iface = self._stub_interface([
+            bytes([self._ACTIVE]),
+            b"",
+            bytes([BDCStatus.ENBDM | BDCStatus.WS]), # WS: the CPU is in wait or stop mode
+        ])
+        with self.assertRaisesRegex(HCS08Error, "wait or stop mode"):
+            asyncio.run(iface.step())
+
+    def test_step_detects_lost_background_mode(self):
+        """If the target is running after a step, no registers are read back from it."""
+        iface = self._stub_interface([
+            bytes([self._ACTIVE]),
+            b"",
+            bytes([BDCStatus.ENBDM]), # neither halted nor in wait/stop: it simply ran away
+        ])
+        with self.assertRaisesRegex(HCS08Error, "did not return to active background mode"):
+            asyncio.run(iface.step())
+        self.assertEqual(len(iface._pipe.sent), 3)
 
     # === FLASH security ===
 

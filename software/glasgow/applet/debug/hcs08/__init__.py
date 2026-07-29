@@ -730,6 +730,9 @@ class DebugHCS08Interface:
     async def read_registers(self) -> dict[str, int]:
         """Read all CPU registers. Requires active background mode."""
         await self._require_active()
+        return await self._read_registers()
+
+    async def _read_registers(self) -> dict[str, int]:
         return {
             "PC":  await self.read_pc(),
             "SP":  await self.read_sp(),
@@ -737,6 +740,26 @@ class DebugHCS08Interface:
             "A":   await self.read_a(),
             "CCR": await self.read_ccr(),
         }
+
+    async def step(self) -> dict[str, int]:
+        """Execute one instruction and return the CPU registers at the resulting PC.
+
+        Requires active background mode, and leaves the target in it.
+        """
+        await self._require_active()
+        await self.trace1()
+        # TRACE1 returns to active background mode once the instruction retires. If it hasn't,
+        # the CPU is no longer fetching instructions where the BDC can reach it, and the register
+        # reads below would report whatever the target happens to hold rather than a stepped
+        # machine state -- so this is caught here instead of being handed back as plausible values.
+        status = await self.read_status()
+        if not status.bdmact:
+            if status.ws:
+                raise HCS08Error(f"target entered wait or stop mode while stepping "
+                                 f"(status {status}); it can only be recovered by a reset")
+            raise HCS08Error(f"target did not return to active background mode after a step "
+                             f"(status {status})")
+        return await self._read_registers()
 
     # === Target control ===
 
@@ -1128,6 +1151,17 @@ class DebugHCS08Applet(GlasgowAppletV2):
         p_operation.add_parser(
             "run", help="resume execution of the user program")
 
+        def count(value):
+            if (result := int(value, 0)) < 1:
+                raise argparse.ArgumentTypeError(f"{value} is not a positive integer")
+            return result
+
+        p_step = p_operation.add_parser(
+            "step", help="execute one instruction at a time, reporting registers after each")
+        p_step.add_argument(
+            "count", metavar="COUNT", type=count, nargs="?", default=1,
+            help="number of instructions to execute (default: %(default)s)")
+
         p_read = p_operation.add_parser(
             "read", help="read target memory")
         p_read.add_argument(
@@ -1203,6 +1237,17 @@ class DebugHCS08Applet(GlasgowAppletV2):
             case "run":
                 await iface.go()
                 self.logger.info("target resumed")
+
+            case "step":
+                # Stepping a running target would first have to stop it, which lands at whatever
+                # instruction the halt happened to catch; that is `halt`'s job to do explicitly.
+                if not (await iface.read_status()).bdmact:
+                    raise HCS08Error("target is running; use `halt` to stop it before stepping")
+                for _ in range(args.count):
+                    registers = await iface.step()
+                    self.logger.info("stepped to PC=%04X SP=%04X H:X=%04X A=%02X CCR=%02X",
+                                     registers["PC"], registers["SP"], registers["H:X"],
+                                     registers["A"], registers["CCR"])
 
             case "read":
                 data = await iface.read(args.address, args.length)
